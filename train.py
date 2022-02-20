@@ -11,6 +11,8 @@ import os
 import random
 import sys
 import time
+import shutil
+import pandas as pd
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +55,73 @@ from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_devic
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+
+
+# Chenglu: add dataset generate function
+def create_txt_file(path: Path, item):
+    """根据 item 生成 txt 文件，并写入在对应的 path
+    """
+    if not item.has_annotations:
+        return
+    anno_str = []
+    for anno in eval(item.annotations):
+        x, y, w, h = anno['x'] / 1280, anno['y'] / 720, anno['width'] / 1280, anno['height'] / 720
+
+        # 有部分框超出边界
+        h = min((1 - y), h)
+        w = min((1 - x), w)
+
+        xc = x + w / 2
+        yc = y + h / 2
+        anno_str.append(f"0 {xc} {yc} {w} {h}")
+    path.write_text("\n".join(anno_str))
+
+
+def generate_new_dataset(dest_dir, bg_ratio):
+
+    train_csv = "/home/featurize/work/patric/mmdetection/video02.csv"
+    val_csv = "/home/featurize/work/patric/mmdetection/video1.csv"
+
+    Path(dest_dir).mkdir(exist_ok=True)
+
+    cfg = f"""
+path: {dest_dir}
+train: images/train2017
+val: images/val2017
+test: images/test2017
+nc: 1
+names: ['patric']
+"""
+    cfg_file = Path(dest_dir) / "dataset.yaml"
+    cfg_file.write_text(cfg)
+
+    train_df = pd.read_csv(train_csv)
+    train_df_with_gt = train_df[train_df.has_annotations]
+    bg_number = int(len(train_df_with_gt) * bg_ratio)
+    train_df_without_gt = train_df[~train_df.has_annotations].sample(bg_number)
+    train_df = pd.concat([train_df_without_gt, train_df_with_gt])
+
+    dfs = {
+        "train": train_df,
+        "val": pd.read_csv(val_csv),
+        "test": pd.read_csv(val_csv)
+    }
+
+    for mode in ["train", "val", "test"]:
+        image_folder = Path(dest_dir) / "images" / f"{mode}2017"
+        shutil.rmtree(image_folder, ignore_errors=True)
+        image_folder.mkdir(parents=True, exist_ok=True)
+
+        label_folder = Path(dest_dir) / "labels" / f"{mode}2017"
+        shutil.rmtree(label_folder, ignore_errors=True)
+        label_folder.mkdir(parents=True, exist_ok=True)
+
+        df = dfs[mode]
+
+        for _, item in tqdm(df.iterrows(), total=len(df)):
+            file_name = f"{item.video_id}_{item.video_frame}"
+            shutil.copy(item.image_path, image_folder / f"{file_name}.jpg")
+            create_txt_file(Path(label_folder) / f"{file_name}.txt", item)
 
 
 def train(hyp,  # path/to/hyp.yaml or hyp dictionary
@@ -98,7 +167,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Config
     plots = not evolve  # create plots
     cuda = device.type != 'cpu'
-    init_seeds(1 + RANK)
+    init_seeds(opt.seed + RANK)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path = data_dict['train'], data_dict['val']
@@ -134,6 +203,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+
+    val_imgszs = [check_img_size(scale, gs, floor=gs * 2) for scale in opt.val_scales]
 
     # Batch size
     if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
@@ -212,7 +283,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Trainloader
     train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
-                                              hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=LOCAL_RANK,
+                                              hyp=hyp, augment=True, cache=False, rect=opt.rect, rank=LOCAL_RANK,
                                               workers=workers, image_weights=opt.image_weights, quad=opt.quad,
                                               prefix=colorstr('train: '), shuffle=True)
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max())  # max label class
@@ -221,10 +292,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Process 0
     if RANK in [-1, 0]:
-        val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
-                                       hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
-                                       workers=workers, pad=0.5,
-                                       prefix=colorstr('val: '))[0]
+        val_loaders = []
+        for val_imgsz in val_imgszs:
+            val_loaders.append(create_dataloader(val_path, val_imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
+                                        hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
+                                        workers=workers, pad=0.5,
+                                        prefix=colorstr('val: '))[0])
 
         if not resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -354,17 +427,23 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             callbacks.run('on_train_epoch_end', epoch=epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
-            if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = val.run(data_dict,
-                                           batch_size=batch_size // WORLD_SIZE * 2,
-                                           imgsz=imgsz,
-                                           model=ema.ema,
-                                           single_cls=single_cls,
-                                           dataloader=val_loader,
-                                           save_dir=save_dir,
-                                           plots=False,
-                                           callbacks=callbacks,
-                                           compute_loss=compute_loss)
+            if epoch >= opt.val_start:
+                for aug in [False, True]:
+                    for scale, val_loader in zip(opt.val_scales, val_loaders):
+                        results, maps, _ = val.run(data_dict,
+                                                batch_size=batch_size // WORLD_SIZE * 2,
+                                                imgsz=opt.imgsz * scale,
+                                                model=ema.ema,
+                                                single_cls=single_cls,
+                                                dataloader=val_loader,
+                                                save_dir=save_dir,
+                                                plots=False,
+                                                callbacks=callbacks,
+                                                compute_loss=False,
+                                                logger=loggers,
+                                                epoch=epoch,
+                                                augment=aug
+                                            )
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -407,6 +486,17 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # if stop:
         #    break  # must break all DDP ranks
 
+        # Chenglu: after every epoch, regenerate all the dataset with 10% background only + 100% ground truth
+        if opt.bg_ratio != 0:
+            generate_new_dataset(Path(opt.data).parent.as_posix(), opt.bg_ratio)
+            train_loader, dataset = create_dataloader(
+                train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
+                hyp=hyp, augment=True, cache=False, rect=opt.rect, rank=LOCAL_RANK,
+                workers=workers, image_weights=opt.image_weights, quad=opt.quad,
+                prefix=colorstr('train: '), shuffle=True
+            )
+        # Chenglu: done
+
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
     if RANK in [-1, 0]:
@@ -428,7 +518,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                             verbose=True,
                                             plots=True,
                                             callbacks=callbacks,
-                                            compute_loss=compute_loss)  # val best model with plots
+                                            compute_loss=False)  # val best model with plots
                     if is_coco:
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
@@ -457,12 +547,13 @@ def parse_opt(known=False):
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
+    parser.add_argument('--bg-ratio', type=float, default=0.1, help='background ratio')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
+    parser.add_argument('--workers', type=int, default=2, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--project', default=ROOT / 'runs/train', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
@@ -473,6 +564,9 @@ def parse_opt(known=False):
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
+    parser.add_argument('--val_scales', type=int, nargs="+", default=[1280], help='evaluation scales')
+    parser.add_argument('--val_start', type=int, default=7, help='which epoch start to evaluation')
+    parser.add_argument('--seed', type=int, default=1, help='seed')
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')
@@ -491,6 +585,8 @@ def main(opt, callbacks=Callbacks()):
         check_git_status()
         check_requirements(exclude=['thop'])
 
+    if opt.bg_ratio != 0:
+        generate_new_dataset(Path(opt.data).parent.as_posix(), opt.bg_ratio)
     # Resume
     if opt.resume and not check_wandb_resume(opt) and not opt.evolve:  # resume an interrupted run
         ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
