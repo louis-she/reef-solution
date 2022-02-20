@@ -1,14 +1,14 @@
 # 2nd Solution of TensorFlow - Help Protect the Great Barrier Reef
 
-![header](assets/header.png)
+![header](/assets/header.png)
 
-This repo contains the training source code of 2nd solution of Kaggle Competition [TensorFlow - Help Protect the Great Barrier Reef](https://www.kaggle.com/c/tensorflow-great-barrier-reef/overview), inference code can be found at this [Kaggle public notebook](https://www.kaggle.com/snaker/yolo-ensemle?scriptVersionId=87785527).
+This repo contains the training source code of 2nd solution of Kaggle Competition [TensorFlow - Help Protect the Great Barrier Reef](https://www.kaggle.com/c/tensorflow-great-barrier-reef/overview), inference code can be found at this [Kaggle public notebook](https://www.kaggle.com/snaker/yolo-ensemle?scriptVersionId=87785527). Training code is modified directely on [YOLOv5](https://github.com/ultralytics/yolov5), so it may not be well organized.
 
 ## Requrements
 
 * Python 3.7+
 * PyTorch==1.9.1+cu111
-* YOLOv5 (already in this repo)
+* [YOLOv5](https://github.com/ultralytics/yolov5) (already in this repo)
 
 ## See what's changed from YOLOv5
 
@@ -20,7 +20,6 @@ git diff db6ec66 -- ':!README.md'
 
 ## How to train it
 
-> Training code are modified directely on [YOLOv5](https://github.com/ultralytics/yolov5), so it may not be well organized.
 
 1. **Generate COCO like dataset.**
 
