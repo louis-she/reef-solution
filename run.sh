@@ -7,12 +7,12 @@ do
 		--img $resolution \
 		--batch 1 \
 		--epochs 13 \
-		--data /home/featurize/trainfull/dataset.yaml \
+		--data $COCO_DEST/dataset.yaml \
 		--bg-ratio 0.0 \
 		--weights yolov5l6.pt \
 		--project /home/featurize/yolov5 \
 		--exist-ok \
-		--name fulltrain-r${resolution} \
+		--name training-r${resolution} \
 		--multi-scale \
 		--hyp ./configs/default.yaml  \
 		--val_scales $resolution  \
